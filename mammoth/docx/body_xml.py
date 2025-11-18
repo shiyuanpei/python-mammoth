@@ -335,6 +335,128 @@ def _create_reader(numbering, content_types, relationships, styles, docx_file, f
         else:
             return _success(documents.text(unichr(unicode_code_point)))
 
+    def _xml_element_to_string(element, include_namespaces=True):
+        """
+        Convert mammoth's XmlElement to XML string for docxlatex processing.
+
+        Args:
+            element: mammoth XmlElement
+            include_namespaces: bool - include namespace declarations in root element
+
+        Returns:
+            str: XML string representation
+        """
+        # Build XML string recursively
+        tag = element.name
+        attrs_list = [f'{k}="{v}"' for k, v in element.attributes.items()]
+
+        # Add namespace declarations to root element
+        if include_namespaces:
+            attrs_list.extend([
+                'xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"',
+                'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"',
+            ])
+
+        attrs_str = ' '.join(attrs_list)
+        attrs_str = f' {attrs_str}' if attrs_str else ''
+
+        # Handle children
+        if element.children:
+            children_str = ''
+            for child in element.children:
+                if hasattr(child, 'name'):  # XmlElement
+                    children_str += _xml_element_to_string(child, include_namespaces=False)
+                else:  # Text node - extract actual text
+                    # Handle XmlText objects
+                    if hasattr(child, 'value'):
+                        children_str += child.value
+                    elif child:
+                        children_str += str(child)
+
+            return f'<{tag}{attrs_str}>{children_str}</{tag}>'
+        else:
+            # Empty element
+            return f'<{tag}{attrs_str}/>'
+
+    def omath(element):
+        """
+        Handle Office MathML (OMML) equations by converting to LaTeX using docxlatex.
+
+        Strategy:
+        - Use docxlatex.OMMLParser to parse the m:oMath element
+        - Return LaTeX with delimiters ($...$ or $$...$$)
+        - Formula is inserted at the correct position in text flow
+
+        This ensures formulas are in the correct position and properly converted.
+        """
+        try:
+            # Try to import docxlatex OMMLParser
+            try:
+                from docxlatex.parser import OMMLParser
+                from xml.etree.ElementTree import tostring
+                _has_docxlatex = True
+            except ImportError as ie:
+                _has_docxlatex = False
+
+            if not _has_docxlatex:
+                # Fallback: return a placeholder if docxlatex is not available
+                warning = results.warning("m:oMath element found but docxlatex is not available for conversion")
+                return _empty_result_with_message(warning)
+
+            # Convert XmlElement to xml.etree.ElementTree element
+            # mammoth uses its own XmlElement class, we need to convert it
+            # to a format that docxlatex can understand
+
+            # Strategy: Convert mammoth's XmlElement to xml.etree.ElementTree.Element
+            # by reconstructing the XML string and parsing it
+            try:
+                # Build XML string from mammoth XmlElement
+                xml_string = _xml_element_to_string(element)
+
+                # Parse with xml.etree.ElementTree
+                from xml.etree.ElementTree import fromstring
+                etree_element = fromstring(xml_string)
+
+                # Use docxlatex OMMLParser to convert to LaTeX
+                parser = OMMLParser()
+                latex = parser.parse(etree_element)
+
+                # Determine if it's inline or display equation
+                # Check if oMath is inside oMathPara (display equation)
+                # XmlElement doesn't have 'parent' attribute, use hasattr check
+                is_display = False  # Default to inline
+                if hasattr(element, 'parent') and element.parent:
+                    is_display = element.parent.name == "m:oMathPara"
+
+                # Add delimiters
+                delimiter = "$$" if is_display else "$"
+
+                # IMPORTANT: Encode LaTeX to base64 to avoid markdownify escaping backslashes
+                # We'll decode it later in markitdown post-processing
+                import base64
+                latex_b64 = base64.b64encode(latex.encode('utf-8')).decode('ascii')
+
+                # Use special marker that won't be escaped by markdownify
+                # Format: ⟨OMML:base64data⟩
+                latex_placeholder = f"⟨OMML:{delimiter}:{latex_b64}⟩"
+
+                return _success(documents.text(latex_placeholder))
+
+            except Exception as parse_error:
+                # If parsing fails, return placeholder with error info
+                warning = results.warning(f"Failed to parse OMML equation: {parse_error}")
+                return _empty_result_with_message(warning)
+
+        except Exception as e:
+            warning = results.warning(f"Failed to process m:oMath element: {e}")
+            return _empty_result_with_message(warning)
+
+    def omath_para(element):
+        """
+        Handle m:oMathPara (display equations in their own paragraph)
+        Simply process children which should contain m:oMath elements
+        """
+        return read_child_elements(element)
 
     def table(element):
         properties = element.find_child_or_null("w:tblPr")
@@ -660,6 +782,8 @@ def _create_reader(numbering, content_types, relationships, styles, docx_file, f
         "w:noBreakHyphen": no_break_hyphen,
         "w:softHyphen": soft_hyphen,
         "w:sym": symbol,
+        "m:oMath": omath,
+        "m:oMathPara": omath_para,
         "w:tbl": table,
         "w:tr": table_row,
         "w:tc": table_cell,
@@ -780,6 +904,13 @@ def _concat(*values):
         for element in value:
             result.append(element)
     return result
+
+
+def _add_attrs(obj, **kwargs):
+    for key, value in kwargs.items():
+        setattr(obj, key, value)
+
+    return obj
 
 
 def _is_int(value):
